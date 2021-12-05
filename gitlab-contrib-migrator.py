@@ -1,57 +1,103 @@
-#!/usr/bin/python
+#!/usr/bin/env python
 
-import sys
-from datetime import datetime
-from bs4 import BeautifulSoup
+import argparse
 import os
+import subprocess
+from datetime import datetime
+from pathlib import Path
+
+import bs4
 from tqdm import tqdm
 
-def createNumOfCommitsOnDate(numOfCommits, date):
-    for i in tqdm(range(numOfCommits)):
-        os.system('echo "Commit number {} on {}" >> commit.md'.format((i+1), date.strftime("%m-%d-%Y")))
-        os.system('export GIT_COMMITTER_DATE="{} 12:00:00"'.format(date.strftime("%m-%d-%Y")))
-        os.system('export GIT_AUTHOR_DATE="{} 12:00:00"'.format(date.strftime("%m-%d-%Y")))
-        os.system('git add --all > /dev/null')
-        os.system('git commit --date="{} 12:00:00" -m "Commit number {} on {}" > /dev/null'.format( date.strftime("%Y-%m-%d"), (i+1), date.strftime("%m-%d-%Y")))
 
-def parseHTMLAndCreateCommits(htmlContents, startDate):
-    fullHtml = BeautifulSoup(htmlContents, 'html.parser')
-    dateRects = fullHtml.find_all("rect", {"class": "user-contrib-cell js-tooltip"})
-    print("Starting commits!\n")
-    for dateRect in tqdm(dateRects):
-        contribsAndDate = dateRect["data-original-title"].split("<br />")
+def parseArguments():
+
+    parser = argparse.ArgumentParser(description="Parses GitLab contributions from profile page HTML and commits with same frequency to other repository.")
+
+    parser.add_argument("html", type=str, help="HTML-file of GitLab profile page")
+    parser.add_argument("repo", type=str, help="path to repository for mirroring commits")
+
+    args = parser.parse_args()
+
+    return args
+
+
+def parseContributions(html_file):
+
+    contributions_per_date = {}
+
+    with open(html_file, "r") as f:
+        html = bs4.BeautifulSoup(f, "html.parser")
+
+    rects = html.find_all("rect", {"class": "user-contrib-cell has-tooltip"})
+    for rect in rects:
+        contribs_and_date = rect["title"].split("<br />")
         try:
-            contribCount = int(contribsAndDate[0].split(" ")[0])
+            contrib_count = int(contribs_and_date[0].split(" ")[0])
         except ValueError:
             continue
-        date = datetime.strptime(contribsAndDate[1], '%A %b %d, %Y')
-        if startDate == -1 or startDate <= date:
-            createNumOfCommitsOnDate(contribCount, date)
-    print("Created commits for contrib chart! Use 'git push' to push to remote or use 'git log' to check commit log")
+        date = contribs_and_date[1].split(">")[1].split("<")[0]
+        date = datetime.strptime(date, "%A %b %d, %Y")
+        contributions_per_date[date] = contrib_count
+    
+    return contributions_per_date
 
 
-def parseArgs(argv):
-    if (len(argv) < 2):
-        print( "Help - Try running: \n\ngitlab-contrib-migrator.py <htmlFile> <startDate> \n\nhtmlFile = HTML file with GitLab info \nstartDate = start commit date in MM-DD-YYYY format" )
-        exit()
-    try:
-        file = open(argv[1], 'rb')
-        htmlContents = file.read()
-    except:
-        print( "Error when trying to read the HTML file: {}".format(argv[1]) )
-        exit()
-    if (len(argv) == 3):
-        try:
-            startDate = datetime.strptime(argv[2], '%m-%d-%Y')
-            return (htmlContents, startDate)
-        except:
-            print( "Error trying to parse start commit date: {} - proceeding without start date".format(argv[2]) )
-    return (htmlContents, -1)
+def commitContributions(repo, contributions_per_date):
 
-def main(argv):
-    htmlContents, startDate = parseArgs(argv)
-    parseHTMLAndCreateCommits(htmlContents, startDate)
+    # check repo
+    if not Path(repo).is_dir():
+        print(f"Repository {repo} not found")
+        return
+    if subprocess.run(["git", "rev-parse"],
+                      cwd=repo,
+                      stdout=subprocess.DEVNULL,
+                      stderr=subprocess.DEVNULL).returncode != 0:
+        print(f"Repository {repo} is not a valid Git repository")
+        return
+
+    # create contributions by making commits at certain date
+    n_total_contribs = sum(contributions_per_date.values())
+    n_committed_contribs = 0
+    tq = tqdm(contributions_per_date)
+    for date in tq:
+
+        n_contribs = contributions_per_date[date]
+        datestr = date.strftime("%m-%d-%Y")
+        tq.set_description(datestr)
+
+        # check for missing contributions on given day
+        n_existing_contribs = int(
+            subprocess.check_output(f"git log --pretty=format:%ad --after='{datestr} 00:00:00' --before='{datestr} 23:59:59' | sort | wc -l",
+                                    shell=True,
+                                    cwd=repo,
+                                    stderr=subprocess.DEVNULL)
+        )
+        n_contribs -= n_existing_contribs
+        if n_contribs <= 0:
+            continue
+        n_committed_contribs += n_contribs
+
+        # make commits
+        env = {
+            **os.environ,
+            "GIT_COMMITTER_DATE": date.strftime(f"{datestr} 12:00:00"),
+            "GIT_AUTHOR_DATE": date.strftime(f"{datestr} 12:00:00"),
+        }
+        for k in range(n_contribs):
+            p = subprocess.run(["git", "commit", "--allow-empty", "-m", "add contribution"],
+                                env=env,
+                                cwd=repo,
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+
+    print(f"Created {n_committed_contribs} new commits in {repo} for a total of {n_total_contribs} mirrored commits.")
 
 
 if __name__ == "__main__":
-   main(sys.argv)
+   
+    args = parseArguments()
+
+    contributions_per_date = parseContributions(args.html)
+
+    commitContributions(args.repo, contributions_per_date)
